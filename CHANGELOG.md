@@ -1,5 +1,9 @@
 # 更新记录
 
+## v0.1.4
+
+- GNOME/Wayland 下读取继续走 XWayland `xclip`，写入改为优先走原生 Wayland `wl-copy`，避免 CopyQ 场景下通过 XWayland 桥接引发的焦点闪动；已在用户设备上验证闪动消失。
+
 ## v0.1.3
 
 - 实现与 TextCascade 桌面端一致的 PBKDF2-HMAC-SHA256 密钥派生和 AES-256-GCM 加解密。

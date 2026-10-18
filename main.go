@@ -651,14 +651,20 @@ func clipboardAvailable() bool {
 }
 func clipboardWrite(text string) error {
 	var cmd *exec.Cmd
-	if os.Getenv("DISPLAY") != "" {
-		if _, e := exec.LookPath("xclip"); e == nil {
-			cmd = exec.Command("xclip", "-selection", "clipboard", "-target", "UTF8_STRING", "-i")
-		}
-	}
-	if cmd == nil && os.Getenv("WAYLAND_DISPLAY") != "" {
+	// On GNOME/Wayland, publish through the native Wayland clipboard even when
+	// XWayland is available. CopyQ's clipboard monitor also integrates with
+	// Wayland; publishing through xclip makes the owner bounce through the
+	// XWayland bridge and can trigger focus flicker while CopyQ is open.
+	if os.Getenv("WAYLAND_DISPLAY") != "" {
 		if _, e := exec.LookPath("wl-copy"); e == nil {
 			cmd = exec.Command("wl-copy", "--type", "text/plain;charset=utf-8")
+		}
+	}
+	if os.Getenv("DISPLAY") != "" {
+		if cmd == nil {
+			if _, e := exec.LookPath("xclip"); e == nil {
+				cmd = exec.Command("xclip", "-selection", "clipboard", "-target", "UTF8_STRING", "-i")
+			}
 		}
 	}
 	if cmd == nil {

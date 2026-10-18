@@ -1,6 +1,6 @@
 # TextCascade Linux 客户端
 
-跨设备剪贴板同步命令行客户端，连接 TextCascade Server 的 `/api/v1/login` 与 `textcascade.v1` WebSocket。支持 Wayland（`wl-clipboard`）和 X11（`xclip` 或 `xsel`）。GNOME/Wayland 建议安装 `xclip`：GNOME 不支持 `wl-paste --watch` 所需的 wlroots data-control 协议，而轮询式 `wl-paste` 会短暂创建透明窗口，可能造成焦点闪动；安装 `xclip` 后客户端通过 XWayland 剪贴板桥读写，并明确使用 UTF-8 目标格式。
+跨设备剪贴板同步命令行客户端，连接 TextCascade Server 的 `/api/v1/login` 与 `textcascade.v1` WebSocket。支持 Wayland（`wl-clipboard`）和 X11（`xclip` 或 `xsel`）。GNOME/Wayland 建议同时安装 `wl-clipboard` 与 `xclip`：客户端通过 `xclip` 读取，避免轮询式 `wl-paste` 创建透明窗口造成焦点闪动；写入优先使用 Wayland 原生 `wl-copy`，没有时才回退到 XWayland 的 `xclip`，并明确使用 UTF-8 格式。
 
 ## 构建
 
@@ -21,7 +21,7 @@ sudo dnf install wl-clipboard xclip
 sudo pacman -S wl-clipboard xclip
 ```
 
-在纯终端/SSH 会话中需要有效桌面会话及 `WAYLAND_DISPLAY` 或 `DISPLAY` 环境变量。
+在纯终端/SSH 会话中需要有效桌面会话及 `WAYLAND_DISPLAY` 或 `DISPLAY` 环境变量。CopyQ 等 Wayland 剪贴板管理器建议使用原生 `wl-copy` 写入路径。
 
 ## 运行
 
