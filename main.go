@@ -1,0 +1,510 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/gorilla/websocket"
+	"golang.org/x/term"
+)
+
+const subprotocol = "textcascade.v1"
+
+type loginResponse struct {
+	Token                    string `json:"token"`
+	MaxTextBytes             int    `json:"maxTextBytes"`
+	HeartbeatIntervalSeconds int    `json:"heartbeatIntervalSeconds"`
+}
+type savedState struct {
+	Version uint64 `json:"version"`
+	Payload string `json:"payload"`
+}
+type serverMessage struct {
+	Type      string `json:"type"`
+	Version   uint64 `json:"version"`
+	ID        string `json:"id"`
+	Payload   string `json:"payload"`
+	Encrypted bool   `json:"encrypted"`
+	Hash      string `json:"hash"`
+	Latest    *struct {
+		Version   uint64 `json:"version"`
+		Payload   string `json:"payload"`
+		Encrypted bool   `json:"encrypted"`
+		Hash      string `json:"hash"`
+	} `json:"latest"`
+	ServerTimeUTC string `json:"serverTimeUtc"`
+	Message       string `json:"message"`
+}
+type client struct {
+	base, username, password, id, name, statePath string
+	insecure                                      bool
+	caFile                                        string
+	maxText                                       int
+	heartbeat                                     int
+	state                                         savedState
+	mu                                            sync.Mutex
+	conn                                          *websocket.Conn
+}
+
+func main() {
+	base := flag.String("server", "", "服务端地址，例如 https://sync.example.com:8443")
+	user := flag.String("username", "", "账号")
+	pass := flag.String("password", "", "密码；省略时交互输入")
+	passFile := flag.String("password-file", "", "从权限受限的文件读取密码")
+	name := flag.String("name", "Linux Clipboard", "设备名称")
+	clientID := flag.String("client-id", "", "设备唯一 ID；省略时自动生成并保存")
+	statePath := flag.String("state", defaultStatePath(), "状态文件路径")
+	ca := flag.String("ca", "", "自签或私有 CA PEM 文件")
+	insecure := flag.Bool("insecure", false, "跳过 TLS 证书校验（仅临时测试）")
+	poll := flag.Duration("poll", 500*time.Millisecond, "剪贴板检查间隔")
+	check := flag.Bool("check", false, "仅验证登录和 WebSocket 协议，不读取或修改剪贴板")
+	flag.Parse()
+	if *base == "" || *user == "" {
+		flag.Usage()
+		os.Exit(2)
+	}
+	if *passFile != "" {
+		b, err := os.ReadFile(*passFile)
+		if err != nil {
+			fatal(err)
+		}
+		*pass = strings.TrimRight(string(b), "\r\n")
+	}
+	if *pass == "" {
+		fmt.Fprint(os.Stderr, "密码: ")
+		b, err := readPassword()
+		if err != nil {
+			fatal(err)
+		}
+		*pass = string(b)
+		fmt.Fprintln(os.Stderr)
+	}
+	c := &client{base: strings.TrimRight(*base, "/"), username: *user, password: *pass, name: *name, statePath: *statePath, insecure: *insecure, caFile: *ca, maxText: 524288, heartbeat: 30}
+	if err := c.loadState(); err != nil {
+		fatal(err)
+	}
+	if *clientID != "" {
+		c.id = *clientID
+	} else {
+		c.id = readOrCreateID(*statePath)
+	}
+	if c.id == "" {
+		fatal(errors.New("无法创建客户端 ID"))
+	}
+	if *check {
+		if err := c.probe(); err != nil {
+			fatal(err)
+		}
+		fmt.Println("检查通过：账号登录成功，WebSocket 握手及 hello/welcome 协议正常。")
+		return
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	fmt.Println("TextCascade Linux 客户端已启动；Ctrl+C 退出。")
+	fmt.Printf("设备: %s (%s)\n", c.name, c.id)
+	if !clipboardAvailable() {
+		fatal(errors.New("找不到可用剪贴板命令。Wayland 安装 wl-clipboard；X11 安装 xclip 或 xsel"))
+	}
+	for ctx.Err() == nil {
+		if err := c.syncSession(ctx, *poll); err != nil && ctx.Err() == nil {
+			fmt.Fprintf(os.Stderr, "连接中断: %v；5 秒后重试\n", err)
+			select {
+			case <-ctx.Done():
+			case <-time.After(5 * time.Second):
+			}
+		}
+	}
+	fmt.Println("已退出。")
+}
+
+func (c *client) probe() error {
+	token, err := c.login()
+	if err != nil {
+		return err
+	}
+	wsURL := strings.Replace(strings.Replace(c.base, "https://", "wss://", 1), "http://", "ws://", 1) + "/api/v1/sync"
+	d := websocket.Dialer{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: c.insecure}, Subprotocols: []string{subprotocol}, HandshakeTimeout: 15 * time.Second}
+	if c.caFile != "" {
+		pem, e := os.ReadFile(c.caFile)
+		if e != nil {
+			return e
+		}
+		roots, _ := x509.SystemCertPool()
+		if roots == nil {
+			roots = x509.NewCertPool()
+		}
+		if !roots.AppendCertsFromPEM(pem) {
+			return errors.New("CA 文件中没有可用证书")
+		}
+		d.TLSClientConfig.RootCAs = roots
+	}
+	conn, _, err := d.Dial(wsURL, http.Header{"Authorization": []string{"Bearer " + token}})
+	if err != nil {
+		return fmt.Errorf("WebSocket 握手失败: %w", err)
+	}
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	if err = conn.WriteJSON(map[string]any{"type": "hello", "clientId": c.id, "clientName": c.name, "lastServerVersion": c.state.Version, "snapshot": nil}); err != nil {
+		return err
+	}
+	for {
+		_, data, e := conn.ReadMessage()
+		if e != nil {
+			return e
+		}
+		var msg serverMessage
+		if e = json.Unmarshal(data, &msg); e != nil {
+			continue
+		}
+		if msg.Type == "welcome" {
+			return nil
+		}
+		if msg.Type == "error" {
+			return fmt.Errorf("服务端拒绝 hello: %s", msg.Message)
+		}
+	}
+}
+func (c *client) httpClient() (*http.Client, error) {
+	tr := &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: c.insecure}}
+	if c.caFile != "" {
+		pem, err := os.ReadFile(c.caFile)
+		if err != nil {
+			return nil, err
+		}
+		roots, _ := x509.SystemCertPool()
+		if roots == nil {
+			roots = x509.NewCertPool()
+		}
+		if !roots.AppendCertsFromPEM(pem) {
+			return nil, errors.New("CA 文件中没有可用证书")
+		}
+		tr.TLSClientConfig.RootCAs = roots
+	}
+	return &http.Client{Transport: tr, Timeout: 15 * time.Second}, nil
+}
+func (c *client) login() (string, error) {
+	h, err := c.httpClient()
+	if err != nil {
+		return "", err
+	}
+	body, _ := json.Marshal(map[string]string{"username": c.username, "password": c.password})
+	req, err := http.NewRequest("POST", c.base+"/api/v1/login", bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	res, err := h.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer res.Body.Close()
+	data, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+	if res.StatusCode != 200 {
+		return "", fmt.Errorf("登录失败 (%s): %s", res.Status, strings.TrimSpace(string(data)))
+	}
+	var out loginResponse
+	if err = json.Unmarshal(data, &out); err != nil {
+		return "", err
+	}
+	if out.Token == "" {
+		return "", errors.New("登录响应没有 token")
+	}
+	if out.MaxTextBytes > 0 {
+		c.maxText = out.MaxTextBytes
+	}
+	if out.HeartbeatIntervalSeconds > 0 {
+		c.heartbeat = out.HeartbeatIntervalSeconds
+	}
+	return out.Token, nil
+}
+func (c *client) syncSession(ctx context.Context, poll time.Duration) error {
+	token, err := c.login()
+	if err != nil {
+		return err
+	}
+	wsURL := strings.Replace(strings.Replace(c.base, "https://", "wss://", 1), "http://", "ws://", 1) + "/api/v1/sync"
+	header := http.Header{"Authorization": []string{"Bearer " + token}}
+	dialer := websocket.Dialer{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: c.insecure}, Subprotocols: []string{subprotocol}, HandshakeTimeout: 15 * time.Second}
+	if c.caFile != "" {
+		pem, e := os.ReadFile(c.caFile)
+		if e != nil {
+			return e
+		}
+		roots, _ := x509.SystemCertPool()
+		if roots == nil {
+			roots = x509.NewCertPool()
+		}
+		if !roots.AppendCertsFromPEM(pem) {
+			return errors.New("CA 文件中没有可用证书")
+		}
+		dialer.TLSClientConfig.RootCAs = roots
+	}
+	conn, res, err := dialer.DialContext(ctx, wsURL, header)
+	if err != nil {
+		if res != nil {
+			return fmt.Errorf("WebSocket 握手失败 (%s): %w", res.Status, err)
+		}
+		return err
+	}
+	c.mu.Lock()
+	c.conn = conn
+	c.mu.Unlock()
+	watchDone := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-watchDone:
+		}
+	}()
+	defer func() { close(watchDone); _ = conn.Close(); c.mu.Lock(); c.conn = nil; c.mu.Unlock() }()
+	conn.SetReadLimit(int64(c.maxText + 256*1024))
+	clip, clipErr := clipboardRead()
+	if clipErr != nil {
+		clip = ""
+	}
+	snap := any(nil)
+	if clip != "" {
+		snap = map[string]any{"payload": clip, "encrypted": false, "hash": hash(clip), "localModifiedAtUtc": time.Now().UTC().Format(time.RFC3339)}
+	}
+	hello := map[string]any{"type": "hello", "clientId": c.id, "clientName": c.name, "lastServerVersion": c.state.Version, "snapshot": snap}
+	if err = conn.WriteJSON(hello); err != nil {
+		return err
+	}
+	fmt.Println("已连接并完成登录")
+	stopPoll := make(chan struct{})
+	defer close(stopPoll)
+	go c.pollClipboard(stopPoll, poll)
+	for {
+		conn.SetReadDeadline(time.Now().Add(time.Duration(c.heartbeat*2+15) * time.Second))
+		_, data, e := conn.ReadMessage()
+		if e != nil {
+			return e
+		}
+		var m serverMessage
+		if e = json.Unmarshal(data, &m); e != nil {
+			continue
+		}
+		switch m.Type {
+		case "welcome":
+			if m.Latest != nil {
+				if e = c.apply(m.Latest.Payload, m.Latest.Version); e != nil {
+					return e
+				}
+			}
+		case "clip":
+			if e = c.apply(m.Payload, m.Version); e != nil {
+				return e
+			}
+		case "ping":
+			e = c.writeJSON(map[string]string{"type": "pong", "clientTimeUtc": time.Now().UTC().Format(time.RFC3339)})
+			if e != nil {
+				return e
+			}
+		case "bye":
+			return fmt.Errorf("服务器结束连接: %s", m.Message)
+		case "error":
+			fmt.Fprintf(os.Stderr, "服务端提示: %s\n", m.Message)
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
+	}
+}
+func (c *client) writeJSON(v any) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.conn == nil {
+		return errors.New("连接已断开")
+	}
+	return c.conn.WriteJSON(v)
+}
+func (c *client) pollClipboard(stop <-chan struct{}, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	last, _ := clipboardRead()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			text, err := clipboardRead()
+			if err != nil || text == "" || text == last {
+				continue
+			}
+			last = text
+			c.mu.Lock()
+			same := text == c.state.Payload
+			conn := c.conn
+			c.mu.Unlock()
+			if same {
+				continue
+			}
+			if len([]byte(text)) > c.maxText {
+				fmt.Fprintln(os.Stderr, "剪贴板文本超过服务端大小限制，已跳过")
+				continue
+			}
+			if conn != nil {
+				err = c.writeJSON(map[string]any{"type": "clip", "id": randomHex(16), "payload": text, "encrypted": false, "hash": hash(text)})
+				if err == nil {
+					fmt.Println("已发送本机剪贴板")
+				}
+			}
+		}
+	}
+}
+func (c *client) apply(text string, version uint64) error {
+	if text == "" {
+		return nil
+	}
+	if len([]byte(text)) > c.maxText {
+		return fmt.Errorf("服务端文本超过客户端限制")
+	}
+	current, _ := clipboardRead()
+	if current != text {
+		if err := clipboardWrite(text); err != nil {
+			return fmt.Errorf("写入系统剪贴板失败: %w", err)
+		}
+	}
+	c.mu.Lock()
+	c.state.Payload = text
+	if version > c.state.Version {
+		c.state.Version = version
+	}
+	c.mu.Unlock()
+	if err := c.saveState(); err != nil {
+		return err
+	}
+	if current != text {
+		fmt.Println("剪贴板已从服务端更新")
+	}
+	return nil
+}
+func clipboardRead() (string, error) {
+	if os.Getenv("WAYLAND_DISPLAY") != "" {
+		if _, e := exec.LookPath("wl-paste"); e == nil {
+			b, e := exec.Command("wl-paste", "--no-newline", "--type", "text/plain").Output()
+			return string(b), e
+		}
+	}
+	if _, e := exec.LookPath("xclip"); e == nil {
+		b, e := exec.Command("xclip", "-selection", "clipboard", "-o").Output()
+		return string(b), e
+	}
+	if _, e := exec.LookPath("xsel"); e == nil {
+		b, e := exec.Command("xsel", "--clipboard", "--output").Output()
+		return string(b), e
+	}
+	if _, e := exec.LookPath("wl-paste"); e == nil {
+		b, e := exec.Command("wl-paste", "--no-newline").Output()
+		return string(b), e
+	}
+	return "", errors.New("clipboard utility not found")
+}
+func clipboardAvailable() bool {
+	for _, name := range []string{"wl-paste", "xclip", "xsel"} {
+		if _, err := exec.LookPath(name); err == nil {
+			return true
+		}
+	}
+	return false
+}
+func clipboardWrite(text string) error {
+	var cmd *exec.Cmd
+	if os.Getenv("WAYLAND_DISPLAY") != "" {
+		if _, e := exec.LookPath("wl-copy"); e == nil {
+			cmd = exec.Command("wl-copy", "--type", "text/plain;charset=utf-8")
+		}
+	}
+	if cmd == nil {
+		if _, e := exec.LookPath("xclip"); e == nil {
+			cmd = exec.Command("xclip", "-selection", "clipboard", "-i")
+		} else if _, e := exec.LookPath("xsel"); e == nil {
+			cmd = exec.Command("xsel", "--clipboard", "--input")
+		} else if _, e := exec.LookPath("wl-copy"); e == nil {
+			cmd = exec.Command("wl-copy")
+		}
+	}
+	if cmd == nil {
+		return errors.New("clipboard utility not found")
+	}
+	cmd.Stdin = strings.NewReader(text)
+	return cmd.Run()
+}
+func hash(s string) string { sum := sha256.Sum256([]byte(s)); return hex.EncodeToString(sum[:]) }
+func randomHex(n int) string {
+	b := make([]byte, n)
+	if _, e := rand.Read(b); e != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
+}
+func defaultStatePath() string {
+	d, e := os.UserConfigDir()
+	if e != nil {
+		return ".config/textcascade/state.json"
+	}
+	return filepath.Join(d, "textcascade", "state.json")
+}
+func readOrCreateID(statePath string) string {
+	path := filepath.Join(filepath.Dir(statePath), "client-id")
+	if b, e := os.ReadFile(path); e == nil && strings.TrimSpace(string(b)) != "" {
+		return strings.TrimSpace(string(b))
+	}
+	id := randomHex(16)
+	_ = os.MkdirAll(filepath.Dir(path), 0700)
+	_ = os.WriteFile(path, []byte(id+"\n"), 0600)
+	return id
+}
+func (c *client) loadState() error {
+	b, e := os.ReadFile(c.statePath)
+	if os.IsNotExist(e) {
+		return nil
+	}
+	if e != nil {
+		return e
+	}
+	return json.Unmarshal(b, &c.state)
+}
+func (c *client) saveState() error {
+	if e := os.MkdirAll(filepath.Dir(c.statePath), 0700); e != nil {
+		return e
+	}
+	b, e := json.Marshal(c.state)
+	if e != nil {
+		return e
+	}
+	tmp := c.statePath + ".tmp"
+	if e = os.WriteFile(tmp, b, 0600); e != nil {
+		return e
+	}
+	return os.Rename(tmp, c.statePath)
+}
+func readPassword() ([]byte, error) {
+	if !term.IsTerminal(int(syscall.Stdin)) {
+		return nil, errors.New("非交互终端请通过 --password 提供密码")
+	}
+	return term.ReadPassword(int(syscall.Stdin))
+}
+func fatal(err error) { fmt.Fprintln(os.Stderr, "错误:", err); os.Exit(1) }

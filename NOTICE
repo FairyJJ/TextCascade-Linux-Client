@@ -1,0 +1,7 @@
+TextCascade Linux Client
+
+This repository provides a Linux clipboard client compatible with the TextCascade Server protocol.
+Upstream project: https://github.com/long45343/TextCascade-Server
+The upstream project is distributed under GNU GPL version 3.0. This client is also distributed under GPL-3.0; see LICENSE.
+
+This client is a separate implementation. It does not include source files copied from the server repository. Product and project names are used only to identify protocol compatibility.
