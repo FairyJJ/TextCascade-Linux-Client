@@ -3,10 +3,15 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -39,6 +44,11 @@ type savedState struct {
 	Version uint64 `json:"version"`
 	Payload string `json:"payload"`
 }
+type encryptedPayload struct {
+	Nonce      string `json:"nonce"`
+	Ciphertext string `json:"ciphertext"`
+	Tag        string `json:"tag"`
+}
 type serverMessage struct {
 	Type      string `json:"type"`
 	Version   uint64 `json:"version"`
@@ -56,14 +66,17 @@ type serverMessage struct {
 	Message       string `json:"message"`
 }
 type client struct {
-	base, username, password, id, name, statePath string
-	insecure                                      bool
-	caFile                                        string
-	maxText                                       int
-	heartbeat                                     int
-	state                                         savedState
-	mu                                            sync.Mutex
-	conn                                          *websocket.Conn
+	base, username, password, id, name, statePath, salt string
+	hashRounds                                          int
+	encryption                                          bool
+	key                                                 []byte
+	insecure                                            bool
+	caFile                                              string
+	maxText                                             int
+	heartbeat                                           int
+	state                                               savedState
+	mu                                                  sync.Mutex
+	conn                                                *websocket.Conn
 }
 
 func main() {
@@ -78,6 +91,9 @@ func main() {
 	insecure := flag.Bool("insecure", false, "跳过 TLS 证书校验（仅临时测试）")
 	poll := flag.Duration("poll", 500*time.Millisecond, "剪贴板检查间隔")
 	check := flag.Bool("check", false, "仅验证登录和 WebSocket 协议，不读取或修改剪贴板")
+	encrypt := flag.Bool("encrypt", true, "启用与 TextCascade 桌面端兼容的端到端加密")
+	salt := flag.String("encryption-salt", "", "端到端加密盐后缀，必须与其他设备一致")
+	rounds := flag.Int("hash-rounds", 664937, "PBKDF2-HMAC-SHA256 迭代次数，必须与其他设备一致")
 	flag.Parse()
 	if *base == "" || *user == "" {
 		flag.Usage()
@@ -99,7 +115,13 @@ func main() {
 		*pass = string(b)
 		fmt.Fprintln(os.Stderr)
 	}
-	c := &client{base: strings.TrimRight(*base, "/"), username: *user, password: *pass, name: *name, statePath: *statePath, insecure: *insecure, caFile: *ca, maxText: 524288, heartbeat: 30}
+	c := &client{base: strings.TrimRight(*base, "/"), username: *user, password: *pass, name: *name, statePath: *statePath, salt: *salt, hashRounds: *rounds, encryption: *encrypt, insecure: *insecure, caFile: *ca, maxText: 524288, heartbeat: 30}
+	if c.hashRounds <= 0 {
+		fatal(errors.New("hash-rounds 必须大于 0"))
+	}
+	if c.encryption {
+		c.key = deriveKey(c.username, c.password, c.salt, c.hashRounds)
+	}
 	if err := c.loadState(); err != nil {
 		fatal(err)
 	}
@@ -285,7 +307,11 @@ func (c *client) syncSession(ctx context.Context, poll time.Duration) error {
 	}
 	snap := any(nil)
 	if clip != "" {
-		snap = map[string]any{"payload": clip, "encrypted": false, "hash": hash(clip), "localModifiedAtUtc": time.Now().UTC().Format(time.RFC3339)}
+		payload, encrypted, e := c.encodePayload(clip)
+		if e != nil {
+			return e
+		}
+		snap = map[string]any{"payload": payload, "encrypted": encrypted, "hash": hash(clip), "localModifiedAtUtc": time.Now().UTC().Format(time.RFC3339)}
 	}
 	hello := map[string]any{"type": "hello", "clientId": c.id, "clientName": c.name, "lastServerVersion": c.state.Version, "snapshot": snap}
 	if err = conn.WriteJSON(hello); err != nil {
@@ -308,12 +334,12 @@ func (c *client) syncSession(ctx context.Context, poll time.Duration) error {
 		switch m.Type {
 		case "welcome":
 			if m.Latest != nil {
-				if e = c.apply(m.Latest.Payload, m.Latest.Version); e != nil {
+				if e = c.apply(m.Latest.Payload, m.Latest.Encrypted, m.Latest.Version); e != nil {
 					return e
 				}
 			}
 		case "clip":
-			if e = c.apply(m.Payload, m.Version); e != nil {
+			if e = c.apply(m.Payload, m.Encrypted, m.Version); e != nil {
 				return e
 			}
 		case "ping":
@@ -383,7 +409,12 @@ func (c *client) pollClipboard(stop <-chan struct{}, interval time.Duration) {
 				lastSent, candidate = text, ""
 				continue
 			}
-			err = c.writeJSON(map[string]any{"type": "clip", "id": randomHex(16), "payload": text, "encrypted": false, "hash": hash(text)})
+			payload, encrypted, encErr := c.encodePayload(text)
+			if encErr != nil {
+				fmt.Fprintf(os.Stderr, "加密剪贴板失败: %v\n", encErr)
+				continue
+			}
+			err = c.writeJSON(map[string]any{"type": "clip", "id": randomHex(16), "payload": payload, "encrypted": encrypted, "hash": hash(text)})
 			if err == nil {
 				lastSent, candidate = text, ""
 				fmt.Println("已发送本机剪贴板")
@@ -391,7 +422,22 @@ func (c *client) pollClipboard(stop <-chan struct{}, interval time.Duration) {
 		}
 	}
 }
-func (c *client) apply(text string, version uint64) error {
+func (c *client) apply(payload string, encrypted bool, version uint64) error {
+	text := payload
+	if encrypted {
+		if len(c.key) == 0 {
+			return errors.New("收到加密剪贴板，但本机未启用加密")
+		}
+		var p encryptedPayload
+		if err := json.Unmarshal([]byte(payload), &p); err != nil {
+			return fmt.Errorf("解析加密剪贴板失败: %w", err)
+		}
+		plain, err := decryptPayload(p, c.key)
+		if err != nil {
+			return fmt.Errorf("解密剪贴板失败；请确认账号密码、加密盐和迭代次数与其他设备一致: %w", err)
+		}
+		text = plain
+	}
 	if text == "" {
 		return nil
 	}
@@ -434,6 +480,102 @@ func (c *client) apply(text string, version uint64) error {
 		fmt.Println("剪贴板已从服务端更新")
 	}
 	return nil
+}
+
+func (c *client) encodePayload(text string) (string, bool, error) {
+	if !c.encryption {
+		return text, false, nil
+	}
+	p, err := encryptPayload(text, c.key)
+	if err != nil {
+		return "", false, err
+	}
+	b, err := json.Marshal(p)
+	return string(b), true, err
+}
+
+func deriveKey(username, password, saltSuffix string, rounds int) []byte {
+	salt := []byte(username + "$" + password + "$" + saltSuffix)
+	return pbkdf2SHA256([]byte(password), salt, rounds, 32)
+}
+
+func encryptPayload(text string, key []byte) (encryptedPayload, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return encryptedPayload{}, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return encryptedPayload{}, err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err = rand.Read(nonce); err != nil {
+		return encryptedPayload{}, err
+	}
+	sealed := gcm.Seal(nil, nonce, []byte(text), nil)
+	cut := len(sealed) - gcm.Overhead()
+	return encryptedPayload{base64.StdEncoding.EncodeToString(nonce), base64.StdEncoding.EncodeToString(sealed[:cut]), base64.StdEncoding.EncodeToString(sealed[cut:])}, nil
+}
+
+func decryptPayload(p encryptedPayload, key []byte) (string, error) {
+	nonce, err := base64.StdEncoding.DecodeString(p.Nonce)
+	if err != nil {
+		return "", err
+	}
+	ciphertext, err := base64.StdEncoding.DecodeString(p.Ciphertext)
+	if err != nil {
+		return "", err
+	}
+	tag, err := base64.StdEncoding.DecodeString(p.Tag)
+	if err != nil {
+		return "", err
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return "", err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+	if len(nonce) != gcm.NonceSize() || len(tag) != gcm.Overhead() {
+		return "", errors.New("不支持的 nonce 或 tag 长度")
+	}
+	return func() (string, error) {
+		plain, e := gcm.Open(nil, nonce, append(ciphertext, tag...), nil)
+		return string(plain), e
+	}()
+}
+
+// PBKDF2-HMAC-SHA256 (RFC 2898), with a 32-byte output key.
+func pbkdf2SHA256(password, salt []byte, rounds, keyLen int) []byte {
+	const hLen = 32
+	out := make([]byte, keyLen)
+	result := out
+	for block := uint32(1); len(out) > 0; block++ {
+		mac := hmac.New(sha256.New, password)
+		var counter [4]byte
+		binary.BigEndian.PutUint32(counter[:], block)
+		mac.Write(salt)
+		mac.Write(counter[:])
+		u := mac.Sum(nil)
+		t := append([]byte(nil), u...)
+		for i := 1; i < rounds; i++ {
+			mac = hmac.New(sha256.New, password)
+			mac.Write(u)
+			u = mac.Sum(nil)
+			for j := range t {
+				t[j] ^= u[j]
+			}
+		}
+		n := len(out)
+		if n > hLen {
+			n = hLen
+		}
+		copy(out, t[:n])
+		out = out[n:]
+	}
+	return result
 }
 func clipboardRead() (string, error) {
 	// On GNOME/Wayland, wl-paste may have to create a temporary transparent

@@ -37,7 +37,7 @@ sudo pacman -S wl-clipboard xclip
 
 `--insecure` 会关闭服务器证书校验，只建议用于临时测试。X11 和 XWayland 环境通过 `xclip` 或 `xsel` 读取剪贴板；其他 Wayland 环境通过 `wl-clipboard` 读取。客户端每 500ms 检查剪贴板，连接断开后自动登录重连。状态和设备 ID 默认保存在 `~/.config/textcascade/`，可用 `--state` 覆盖状态文件。使用 Ctrl+C 退出。
 
-发送的是未加密文本（协议字段 `encrypted=false`），传输通过 TLS 保护。程序不会同步图片、文件或富文本。
+默认启用与 TextCascade 桌面端兼容的端到端加密（PBKDF2-HMAC-SHA256，默认 664937 轮；AES-256-GCM）。加密密钥由账号、登录密码和加密盐派生；其他设备必须使用相同的加密盐和迭代次数。可用 `--encryption-salt` 和 `--hash-rounds` 设置非默认参数。`--encrypt=false` 可用于未启用端到端加密的服务端/设备。程序不会同步图片、文件或富文本。
 
 ## 图形托盘版（GNOME / Wayland）
 
