@@ -22,6 +22,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gorilla/websocket"
 	"golang.org/x/term"
@@ -343,33 +344,49 @@ func (c *client) writeJSON(v any) error {
 func (c *client) pollClipboard(stop <-chan struct{}, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	last, _ := clipboardRead()
+	lastSent, _ := clipboardRead()
+	candidate := ""
+	var candidateSince time.Time
+	const stableFor = 1200 * time.Millisecond
 	for {
 		select {
 		case <-stop:
 			return
 		case <-ticker.C:
 			text, err := clipboardRead()
-			if err != nil || text == "" || text == last {
+			if err != nil || text == "" {
 				continue
 			}
-			last = text
+			if text == lastSent {
+				candidate = ""
+				continue
+			}
 			c.mu.Lock()
 			same := text == c.state.Payload
 			conn := c.conn
 			c.mu.Unlock()
 			if same {
+				lastSent = text
+				candidate = ""
+				continue
+			}
+			if candidate != text {
+				candidate = text
+				candidateSince = time.Now()
+				continue
+			}
+			if time.Since(candidateSince) < stableFor || conn == nil {
 				continue
 			}
 			if len([]byte(text)) > c.maxText {
 				fmt.Fprintln(os.Stderr, "剪贴板文本超过服务端大小限制，已跳过")
+				lastSent, candidate = text, ""
 				continue
 			}
-			if conn != nil {
-				err = c.writeJSON(map[string]any{"type": "clip", "id": randomHex(16), "payload": text, "encrypted": false, "hash": hash(text)})
-				if err == nil {
-					fmt.Println("已发送本机剪贴板")
-				}
+			err = c.writeJSON(map[string]any{"type": "clip", "id": randomHex(16), "payload": text, "encrypted": false, "hash": hash(text)})
+			if err == nil {
+				lastSent, candidate = text, ""
+				fmt.Println("已发送本机剪贴板")
 			}
 		}
 	}
@@ -381,8 +398,25 @@ func (c *client) apply(text string, version uint64) error {
 	if len([]byte(text)) > c.maxText {
 		return fmt.Errorf("服务端文本超过客户端限制")
 	}
-	current, _ := clipboardRead()
-	if current != text {
+	c.mu.Lock()
+	if version < c.state.Version {
+		c.mu.Unlock()
+		return nil
+	}
+	if text == c.state.Payload {
+		changed := version > c.state.Version
+		if changed {
+			c.state.Version = version
+		}
+		c.mu.Unlock()
+		if changed {
+			return c.saveState()
+		}
+		return nil
+	}
+	c.mu.Unlock()
+	current, readErr := clipboardRead()
+	if readErr != nil || current != text {
 		if err := clipboardWrite(text); err != nil {
 			return fmt.Errorf("写入系统剪贴板失败: %w", err)
 		}
@@ -396,7 +430,7 @@ func (c *client) apply(text string, version uint64) error {
 	if err := c.saveState(); err != nil {
 		return err
 	}
-	if current != text {
+	if readErr != nil || current != text {
 		fmt.Println("剪贴板已从服务端更新")
 	}
 	return nil
@@ -404,23 +438,47 @@ func (c *client) apply(text string, version uint64) error {
 func clipboardRead() (string, error) {
 	if os.Getenv("WAYLAND_DISPLAY") != "" {
 		if _, e := exec.LookPath("wl-paste"); e == nil {
-			b, e := exec.Command("wl-paste", "--no-newline", "--type", "text/plain").Output()
-			return string(b), e
+			for _, mime := range []string{"text/plain;charset=utf-8", "text/plain"} {
+				b, err := exec.Command("wl-paste", "--no-newline", "--type", mime).Output()
+				if err == nil {
+					return validClipboardText(b)
+				}
+			}
+			b, err := exec.Command("wl-paste", "--no-newline").Output()
+			if err == nil {
+				return validClipboardText(b)
+			}
+			return "", err
 		}
 	}
 	if _, e := exec.LookPath("xclip"); e == nil {
-		b, e := exec.Command("xclip", "-selection", "clipboard", "-o").Output()
-		return string(b), e
+		b, err := exec.Command("xclip", "-selection", "clipboard", "-o").Output()
+		if err != nil {
+			return "", err
+		}
+		return validClipboardText(b)
 	}
 	if _, e := exec.LookPath("xsel"); e == nil {
-		b, e := exec.Command("xsel", "--clipboard", "--output").Output()
-		return string(b), e
+		b, err := exec.Command("xsel", "--clipboard", "--output").Output()
+		if err != nil {
+			return "", err
+		}
+		return validClipboardText(b)
 	}
 	if _, e := exec.LookPath("wl-paste"); e == nil {
-		b, e := exec.Command("wl-paste", "--no-newline").Output()
-		return string(b), e
+		b, err := exec.Command("wl-paste", "--no-newline").Output()
+		if err != nil {
+			return "", err
+		}
+		return validClipboardText(b)
 	}
 	return "", errors.New("clipboard utility not found")
+}
+func validClipboardText(b []byte) (string, error) {
+	if !utf8.Valid(b) {
+		return "", errors.New("clipboard text is not valid UTF-8")
+	}
+	return string(b), nil
 }
 func clipboardAvailable() bool {
 	for _, name := range []string{"wl-paste", "xclip", "xsel"} {

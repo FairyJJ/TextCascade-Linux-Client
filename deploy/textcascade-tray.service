@@ -5,6 +5,7 @@ PartOf=graphical-session.target
 
 [Service]
 Type=simple
+Environment=QT_QPA_PLATFORM=xcb
 ExecStart=/usr/bin/python3 %h/.local/share/textcascade/textcascade_tray.py --background
 Restart=on-failure
 RestartSec=3
