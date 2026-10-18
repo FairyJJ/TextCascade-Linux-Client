@@ -39,9 +39,31 @@ sudo dnf install wl-clipboard xclip
 
 ## 图形托盘版（GNOME / Wayland）
 
-本项目提供 PyQt6 托盘控制程序 `textcascade_tray.py`。它管理 `textcascade-client.service`，由用户级 systemd `graphical-session.target` 启动，以 `--background` 静默进入托盘；关闭主窗口只隐藏窗口，托盘菜单可打开窗口、暂停/继续同步、重新连接或退出并停止同步。GNOME 需要启用 AppIndicator 扩展。
+客户端包含 PyQt6 托盘控制界面。登录图形桌面后，用户级 systemd 服务会静默启动到托盘；关闭主窗口会隐藏窗口。托盘菜单可打开窗口、暂停/继续同步、重新连接，或退出并停止同步。GNOME 需要启用 AppIndicator 扩展。
 
-安装托盘程序后，可从应用菜单打开 TextCascade；设置窗口也能切换登录自启。命令行客户端仍负责剪贴板协议和同步。
+### 安装到用户目录
+
+1. 安装 Go 1.23+、Python 3 的 PyQt6、剪贴板工具和 GNOME AppIndicator 扩展；Wayland 推荐 `wl-clipboard`。
+2. 构建并安装命令行客户端：
+
+   ```sh
+   go build -trimpath -o textcascade-client .
+   install -Dm755 textcascade-client ~/.local/bin/textcascade-client
+   install -d -m700 ~/.config/textcascade
+   ```
+
+3. 创建仅自己可读的密码文件 `~/.config/textcascade/password`，然后执行 `chmod 600 ~/.config/textcascade/password`。
+4. 复制 `textcascade-client.service.example` 到 `~/.config/systemd/user/textcascade-client.service`，修改服务地址和账号。
+5. 安装托盘程序和服务单元：
+
+   ```sh
+   install -Dm755 textcascade_tray.py ~/.local/share/textcascade/textcascade_tray.py
+   install -Dm644 deploy/textcascade-tray.service ~/.config/systemd/user/textcascade-tray.service
+   systemctl --user daemon-reload
+   systemctl --user enable --now textcascade-client.service textcascade-tray.service
+   ```
+
+窗口里的自启复选框会同时启用或关闭两个用户服务。托盘 GUI 通过单实例 IPC 工作；从应用菜单再次启动会打开已运行的主窗口。
 
 ## 许可与上游
 
