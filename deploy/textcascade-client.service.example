@@ -5,6 +5,7 @@ PartOf=graphical-session.target
 
 [Service]
 Type=simple
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=%h/.local/bin/textcascade-client --server https://your-server.example:8443 --username YOUR_USERNAME --password-file %h/.config/textcascade/password --name Linux
 Restart=on-failure
 RestartSec=5

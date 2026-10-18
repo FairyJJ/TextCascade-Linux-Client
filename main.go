@@ -436,6 +436,16 @@ func (c *client) apply(text string, version uint64) error {
 	return nil
 }
 func clipboardRead() (string, error) {
+	// On GNOME/Wayland, wl-paste may have to create a temporary transparent
+	// surface for every read when the compositor lacks the wlroots data-control
+	// protocol. Polling that surface steals focus and looks like repeated input.
+	// XWayland's clipboard bridge avoids that popup, so prefer xclip whenever
+	// both displays are available.
+	if os.Getenv("DISPLAY") != "" {
+		if _, e := exec.LookPath("xclip"); e == nil {
+			return clipboardReadXclip()
+		}
+	}
 	if os.Getenv("WAYLAND_DISPLAY") != "" {
 		if _, e := exec.LookPath("wl-paste"); e == nil {
 			for _, mime := range []string{"text/plain;charset=utf-8", "text/plain"} {
@@ -474,6 +484,15 @@ func clipboardRead() (string, error) {
 	}
 	return "", errors.New("clipboard utility not found")
 }
+func clipboardReadXclip() (string, error) {
+	for _, target := range []string{"UTF8_STRING", "text/plain;charset=utf-8", "text/plain"} {
+		b, err := exec.Command("xclip", "-selection", "clipboard", "-o", "-target", target).Output()
+		if err == nil {
+			return validClipboardText(b)
+		}
+	}
+	return "", errors.New("xclip could not read clipboard text")
+}
 func validClipboardText(b []byte) (string, error) {
 	if !utf8.Valid(b) {
 		return "", errors.New("clipboard text is not valid UTF-8")
@@ -490,14 +509,19 @@ func clipboardAvailable() bool {
 }
 func clipboardWrite(text string) error {
 	var cmd *exec.Cmd
-	if os.Getenv("WAYLAND_DISPLAY") != "" {
+	if os.Getenv("DISPLAY") != "" {
+		if _, e := exec.LookPath("xclip"); e == nil {
+			cmd = exec.Command("xclip", "-selection", "clipboard", "-target", "UTF8_STRING", "-i")
+		}
+	}
+	if cmd == nil && os.Getenv("WAYLAND_DISPLAY") != "" {
 		if _, e := exec.LookPath("wl-copy"); e == nil {
 			cmd = exec.Command("wl-copy", "--type", "text/plain;charset=utf-8")
 		}
 	}
 	if cmd == nil {
 		if _, e := exec.LookPath("xclip"); e == nil {
-			cmd = exec.Command("xclip", "-selection", "clipboard", "-i")
+			cmd = exec.Command("xclip", "-selection", "clipboard", "-target", "UTF8_STRING", "-i")
 		} else if _, e := exec.LookPath("xsel"); e == nil {
 			cmd = exec.Command("xsel", "--clipboard", "--input")
 		} else if _, e := exec.LookPath("wl-copy"); e == nil {

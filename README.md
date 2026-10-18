@@ -1,6 +1,6 @@
 # TextCascade Linux 客户端
 
-跨设备剪贴板同步命令行客户端，连接 TextCascade Server 的 `/api/v1/login` 与 `textcascade.v1` WebSocket。支持 Wayland（`wl-clipboard`）和 X11（`xclip` 或 `xsel`）。
+跨设备剪贴板同步命令行客户端，连接 TextCascade Server 的 `/api/v1/login` 与 `textcascade.v1` WebSocket。支持 Wayland（`wl-clipboard`）和 X11（`xclip` 或 `xsel`）。GNOME/Wayland 建议安装 `xclip`：GNOME 不支持 `wl-paste --watch` 所需的 wlroots data-control 协议，而轮询式 `wl-paste` 会短暂创建透明窗口，可能造成焦点闪动；安装 `xclip` 后客户端通过 XWayland 剪贴板桥读写，并明确使用 UTF-8 目标格式。
 
 ## 构建
 
@@ -17,6 +17,8 @@ go build -trimpath -o textcascade-client .
 sudo apt install wl-clipboard xclip
 # Fedora
 sudo dnf install wl-clipboard xclip
+# Arch Linux / EndeavourOS
+sudo pacman -S wl-clipboard xclip
 ```
 
 在纯终端/SSH 会话中需要有效桌面会话及 `WAYLAND_DISPLAY` 或 `DISPLAY` 环境变量。
@@ -33,7 +35,7 @@ sudo dnf install wl-clipboard xclip
 ./textcascade-client --server https://your-server.example:8443 --username alice --ca /path/to/ca.pem
 ```
 
-`--insecure` 会关闭服务器证书校验，只建议用于临时测试。客户端每 500ms 检查剪贴板，连接断开后自动登录重连。状态和设备 ID 默认保存在 `~/.config/textcascade/`，可用 `--state` 覆盖状态文件。使用 Ctrl+C 退出。
+`--insecure` 会关闭服务器证书校验，只建议用于临时测试。X11 和 XWayland 环境通过 `xclip` 或 `xsel` 读取剪贴板；其他 Wayland 环境通过 `wl-clipboard` 读取。客户端每 500ms 检查剪贴板，连接断开后自动登录重连。状态和设备 ID 默认保存在 `~/.config/textcascade/`，可用 `--state` 覆盖状态文件。使用 Ctrl+C 退出。
 
 发送的是未加密文本（协议字段 `encrypted=false`），传输通过 TLS 保护。程序不会同步图片、文件或富文本。
 
